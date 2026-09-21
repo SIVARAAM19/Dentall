@@ -3,9 +3,10 @@ import "./styles/index.css";
 import BrushColorShowcase from "./components/BrushColorShowcase";
 import ReviewFormSection from "./components/ReviewFormSection";
 import ShipmentPage from "./components/ShipmentPage";
-import TrackingSection from "./components/TrackingSection";
+import DealerEnquiryModal from "./components/DealerEnquiryModal";
 import videoThumbnail from "./assets/dentall-video-thumbnail1.png";
 import {
+  cartWeightKg,
   discountPercent,
   FAMILY_PACK_MRP,
   FAMILY_PACK_PRICE,
@@ -45,6 +46,7 @@ export default function DentallApp() {
   const [toast, setToast]   = useState({ show:false, msg:'' });
   const [showVideo, setShowVideo] = useState(false);
   const [showWholesale, setShowWholesale] = useState(false);
+  const [showDealer, setShowDealer] = useState(false);
   const [wholesaleSubmitted, setWholesaleSubmitted] = useState(false);
   const [wholesaleSubmitting, setWholesaleSubmitting] = useState(false);
   const [wholesaleError, setWholesaleError] = useState('');
@@ -76,7 +78,9 @@ export default function DentallApp() {
   const [payProcessing, setPayProcessing] = useState(false);
   const [paySuccess, setPaySuccess]       = useState(false);
   const [successOrder, setSuccessOrder]   = useState({ orderId:'', awb:'' });
-  const [showShipment, setShowShipment]   = useState(false);
+  // Open the shipment page straight away for links like  /#shipment?order=42  (receipt email)
+  const [showShipment, setShowShipment]   = useState(() => /^#(shipment|tracking)/.test(window.location.hash));
+  const [shipmentOrderId, setShipmentOrderId] = useState('');
   const [dbReviews, setDbReviews]         = useState([]);
 
   const fetchReviews = () => {
@@ -340,7 +344,7 @@ export default function DentallApp() {
     if (!pincode || pincode.length !== 6) return;
     setShippingLoading(true);
     try {
-      const totalWeight = cartItems.reduce((sum, item) => sum + (item.qty * 0.5), 0); // 0.5kg per brush
+      const totalWeight = cartWeightKg(cartItems); // 0.25kg per pack, min 0.5kg
       const res  = await fetch('/api/shipping-cost', {
         method:'POST',
         headers:{ 'Content-Type':'application/json' },
@@ -362,7 +366,7 @@ export default function DentallApp() {
   if (!pin || pin.length !== 6) return;
   setModalShipLoading(true);
   try {
-    const totalWeight = cartItems.reduce((sum, item) => sum + (item.qty * 0.5), 0); // 0.5kg per brush
+    const totalWeight = cartWeightKg(cartItems); // 0.25kg per pack, min 0.5kg
     const res = await fetch('/api/shipping-cost', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -394,7 +398,7 @@ export default function DentallApp() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         cartItems,                                  // server re-validates these
-        shippingCharge: modalShipping?.charge ?? 0, // server caps this safely
+        pincode: form.pincode,                      // server quotes shipping from this
         couponCode: coupon?.code,                   // server re-validates this too
       }),
     });
@@ -433,7 +437,7 @@ export default function DentallApp() {
         address: form.address,
         pincode: form.pincode,
       },
-      theme: { color: 'var(--primary)' },
+      theme: { color: '#C8102E' },
  
       handler: async (response) => {
         // Step 3 — verify on backend
@@ -455,10 +459,9 @@ export default function DentallApp() {
                 pincode: form.pincode,
               },
               cartItems,
-              shippingCharge: modalShipping?.charge ?? 0,
               couponCode: coupon?.code,
-              // NOTE: totalAmount is NOT sent — server computes it from
-              // cartItems + shippingCharge + couponCode using its own catalogue prices.
+              // NOTE: totalAmount and shippingCharge are NOT sent — the server
+              // computes them from cartItems + pincode + couponCode.
             }),
           });
  
@@ -609,7 +612,8 @@ export default function DentallApp() {
           <a href="#features-grid" onClick={e=>{e.preventDefault();scrollTo('features-grid')}}>Features</a>
           <a href="#social"        onClick={e=>{e.preventDefault();scrollTo('social')}}>Reviews</a>
           {/* <a href="#tracking"      onClick={e=>{e.preventDefault();scrollTo('tracking')}}>Track</a> */}
-          <a href="#shipment"      onClick={e=>{e.preventDefault();setShowShipment(true);}}>Shipment</a>
+          <a href="#shipment"      onClick={e=>{e.preventDefault();setShipmentOrderId('');setShowShipment(true);}}>Shipment</a>
+          <a href="#dealers"       onClick={e=>{e.preventDefault();setShowDealer(true);}}>Dealers</a>
           <button className="dn-cart-btn" onClick={()=>setCartOpen(o=>!o)}>
             🛒 Cart {cartCount > 0 && <span className="dn-cart-badge">{cartCount}</span>}
           </button>
@@ -626,7 +630,8 @@ export default function DentallApp() {
         <a href="#features-grid" onClick={e=>{e.preventDefault();scrollTo('features-grid')}}>Features</a>
         <a href="#social"        onClick={e=>{e.preventDefault();scrollTo('social')}}>Reviews</a>
         {/* <a href="#tracking"      onClick={e=>{e.preventDefault();scrollTo('tracking')}}>Track Order</a> */}
-        <a href="#shipment"      onClick={e=>{e.preventDefault();setShowShipment(true);setDrawerOpen(false);}}>Shipment</a>
+        <a href="#shipment"      onClick={e=>{e.preventDefault();setShipmentOrderId('');setShowShipment(true);setDrawerOpen(false);}}>Shipment</a>
+        <a href="#dealers"       onClick={e=>{e.preventDefault();setShowDealer(true);setDrawerOpen(false);}}>Dealers</a>
         <a href="#order"         onClick={e=>{e.preventDefault();scrollTo('order')}}>Order</a>
         <button className="dn-cart-btn" style={{fontSize:'1rem',padding:'.8rem 2rem'}} onClick={()=>{setDrawerOpen(false);setCartOpen(true);}}>
           🛒 Cart {cartCount > 0 && <span className="dn-cart-badge">{cartCount}</span>}
@@ -1112,7 +1117,7 @@ export default function DentallApp() {
         </div>
       )}
 
-      <TrackingSection />
+      {showDealer && <DealerEnquiryModal onClose={() => setShowDealer(false)} />}
 
       {/* ── Footer ── */}
       <footer className="dn-footer">
@@ -1121,6 +1126,9 @@ export default function DentallApp() {
           <span className="dn-logo-tagline">a quality product from Brooks &amp; Meadows</span>
         </div>
         <div className="dn-footer-copy">© 2025 Dentall. All rights reserved.</div>
+        <div className="dn-footer-credit">
+          designed by justmakeit · <a href="mailto:justmakeit654@gmail.com">justmakeit654@gmail.com</a>
+        </div>
         <div className="dn-footer-social">
           <a href="https://wa.me/919489127937?text=Hi%20DENTALL%20team%2C%20a%20client%20is%20checking%20out%20your%20product%20and%20has%20a%20question" target="_blank" rel="noopener noreferrer" aria-label="Chat with Dentall on WhatsApp">
             <img src="https://upload.wikimedia.org/wikipedia/commons/6/6b/WhatsApp.svg" alt="WhatsApp" className="dn-footer-social-icon" />
@@ -1157,7 +1165,7 @@ export default function DentallApp() {
                     </div>
                   </div>
                 )}
-                <button className="dn-pay-done-btn" onClick={()=>{closePayment();setShowShipment(true);}}>View Shipment Details →</button>
+                <button className="dn-pay-done-btn" onClick={()=>{closePayment();setShipmentOrderId(String(successOrder.orderId));setShowShipment(true);}}>View Shipment Details →</button>
               </div>
             ) : (
               <div className="dn-pay-body">
@@ -1439,7 +1447,18 @@ export default function DentallApp() {
       )}
 
       {/* ── Shipment Page ── */}
-      {showShipment && <ShipmentPage onClose={() => setShowShipment(false)} />}
+      {showShipment && (
+        <ShipmentPage
+          initialOrderId={shipmentOrderId}
+          onClose={() => {
+            setShowShipment(false);
+            setShipmentOrderId('');
+            if (/^#(shipment|tracking)/.test(window.location.hash)) {
+              window.history.replaceState(null, '', window.location.pathname + window.location.search);
+            }
+          }}
+        />
+      )}
 
     </>
   );

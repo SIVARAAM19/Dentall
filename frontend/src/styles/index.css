@@ -47,3 +47,6 @@
 
 /* Shipment Page */
 @import './shipment.css';
+
+/* Dealer enquiries, quote page & admin */
+@import './dealer.css';

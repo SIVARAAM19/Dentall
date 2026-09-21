@@ -26,7 +26,10 @@
 //    YOUR_PINCODE              — your warehouse/pickup pincode
 //    SHIPROCKET_EMAIL          — (required only when USE_MOCK_SHIPROCKET=false)
 //    SHIPROCKET_PASSWORD       — (required only when USE_MOCK_SHIPROCKET=false)
+//    SHIPROCKET_PASSWORD_B64   — optional: base64 of the password, used instead of SHIPROCKET_PASSWORD
+//                                when the password has special characters ($ # & ! ^)
 //    SITE_URL                  — your public site URL for email links
+//    DENTALL_ADMIN_SECRET      — secret for the /admin panel (x-admin-token header)
 //
 //  DEPENDENCIES:
 //    npm install express razorpay crypto nodemailer mysql2 axios
@@ -63,12 +66,27 @@ const ALWAYS_REQUIRED = [
   'ALLOWED_ORIGIN',
   'YOUR_PINCODE',
   'SITE_URL',
+  'DENTALL_ADMIN_SECRET',
 ];
 
-// Shiprocket creds only needed in real mode
+// Shiprocket creds only needed in real mode. The password may be supplied either
+// as SHIPROCKET_PASSWORD or, when it contains characters hosting panels mangle
+// ($ # & ! ^ ...), base64-encoded as SHIPROCKET_PASSWORD_B64.
 const USE_MOCK = process.env.USE_MOCK_SHIPROCKET === 'true';
 if (!USE_MOCK) {
-  ALWAYS_REQUIRED.push('SHIPROCKET_EMAIL', 'SHIPROCKET_PASSWORD');
+  ALWAYS_REQUIRED.push('SHIPROCKET_EMAIL');
+  if (!process.env.SHIPROCKET_PASSWORD_B64) ALWAYS_REQUIRED.push('SHIPROCKET_PASSWORD');
+}
+
+function getShiprocketCredentials() {
+  const b64 = (process.env.SHIPROCKET_PASSWORD_B64 || '').trim();
+  return {
+    email:    (process.env.SHIPROCKET_EMAIL || '').trim(),
+    password: b64
+      ? Buffer.from(b64, 'base64').toString('utf8')
+      : (process.env.SHIPROCKET_PASSWORD || '').trim(),
+    source:   b64 ? 'SHIPROCKET_PASSWORD_B64' : 'SHIPROCKET_PASSWORD',
+  };
 }
 
 const missingEnv = ALWAYS_REQUIRED.filter(k => !process.env[k]);
@@ -84,6 +102,12 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 console.log(`\n🚀 DENTALL server booting...`);
 console.log(`   Mode:     ${IS_PROD ? '🔴 PRODUCTION' : '🟡 DEVELOPMENT'}`);
 console.log(`   Shipping: ${USE_MOCK ? '🧪 MOCK Shiprocket' : '✅ REAL Shiprocket'}`);
+if (!USE_MOCK) {
+  // Length only — never log the password itself. Helps spot values that a
+  // hosting panel truncated or altered (e.g. cut at a "#").
+  const c = getShiprocketCredentials();
+  console.log(`   Shiprocket login: ${c.email.replace(/(.{2}).+(@.+)/, '$1****$2')} | password from ${c.source}, ${c.password.length} chars`);
+}
 console.log(`   Origin:   ${process.env.ALLOWED_ORIGIN}\n`);
 
 // ============================================================
@@ -207,7 +231,7 @@ if (!IS_PROD) {
     const origin = req.headers.origin || '*';
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-admin-token');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
@@ -222,7 +246,7 @@ if (!IS_PROD) {
       cb(new Error('Not allowed by CORS'));
     },
     credentials: true,
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token'],
   }));
 }
@@ -315,12 +339,6 @@ db.getConnection()
         INDEX idx_created  (created_at)
       )
     `);
-    // approve any reviews submitted before auto-approve was enabled
-    const [migrated] = await conn.execute(
-      'UPDATE reviews SET approved = TRUE WHERE approved = FALSE'
-    );
-    if (migrated.affectedRows > 0)
-      console.log(`✅ Approved ${migrated.affectedRows} existing review(s)`);
     console.log('✅ reviews table ready');
     await conn.execute(`
       CREATE TABLE IF NOT EXISTS wholesale_enquiries (
@@ -384,6 +402,47 @@ db.getConnection()
     }
     console.log(`✅ coupons table ready, ${couponRows.length} coupon(s) loaded`);
 
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS dealer_enquiries (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        contact_name  VARCHAR(150) NOT NULL,
+        shop_name     VARCHAR(180) NOT NULL,
+        gstin         VARCHAR(15)  NOT NULL,
+        email         VARCHAR(150) NOT NULL,
+        phone         VARCHAR(20)  NOT NULL,
+        address       TEXT         NOT NULL,
+        city          VARCHAR(100) NOT NULL,
+        state         VARCHAR(100) NOT NULL,
+        pincode       VARCHAR(6)   NOT NULL,
+        quantity      INT          NOT NULL,
+        message       TEXT,
+        status        VARCHAR(30)  DEFAULT 'new',
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_dealer_email   (email),
+        INDEX idx_dealer_status  (status),
+        INDEX idx_dealer_created (created_at)
+      )
+    `);
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS dealer_quotes (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        enquiry_id      INT           NOT NULL,
+        token           CHAR(64)      NOT NULL,
+        quantity        INT           NOT NULL,
+        goods_total     DECIMAL(12,2) NOT NULL,
+        gst_percent     DECIMAL(5,2)  NOT NULL DEFAULT 0,
+        freight         DECIMAL(10,2) NOT NULL DEFAULT 0,
+        advance_percent DECIMAL(5,2)  NOT NULL DEFAULT 0,
+        notes           TEXT,
+        valid_until     DATE          NOT NULL,
+        status          VARCHAR(20)   NOT NULL DEFAULT 'sent',
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_quote_token (token),
+        INDEX idx_quote_enquiry (enquiry_id)
+      )
+    `);
+    console.log('✅ dealer_enquiries + dealer_quotes tables ready');
+
     // Older installs may not have these columns yet — add them defensively
     for (const stmt of [
       'ALTER TABLE orders ADD COLUMN coupon_code VARCHAR(30) NULL',
@@ -415,14 +474,21 @@ let tokenExpiry      = 0;
 
 async function getShiprocketToken() {
   if (shiprocketToken && Date.now() < tokenExpiry) return shiprocketToken;
-  const { data } = await axios.post(
-    'https://apiv2.shiprocket.in/v1/external/auth/login',
-    {
-      email:    process.env.SHIPROCKET_EMAIL,
-      password: process.env.SHIPROCKET_PASSWORD,
-    },
-    { timeout: 10000 }
-  );
+  const { email, password } = getShiprocketCredentials();
+  let data;
+  try {
+    ({ data } = await axios.post(
+      'https://apiv2.shiprocket.in/v1/external/auth/login',
+      { email, password },
+      { timeout: 10000 }
+    ));
+  } catch (e) {
+    if (e.response?.status === 403 || e.response?.status === 401) {
+      console.error('❌ Shiprocket login rejected — check SHIPROCKET_EMAIL and the API user password ' +
+        '(if it has special characters, set SHIPROCKET_PASSWORD_B64 instead)');
+    }
+    throw e;
+  }
   shiprocketToken = data.token;
   tokenExpiry     = Date.now() + 9 * 24 * 60 * 60 * 1000; // 9 days (token lasts 10)
   return shiprocketToken;
@@ -451,14 +517,61 @@ function mockTrackingData(awbNumber, orderId) {
   };
 }
 
+// Single source of truth for the delivery charge — used by /api/shipping-cost
+// (display) AND /api/create-order (the amount actually charged).
+async function getShippingQuote(pincode, weight) {
+  if (USE_MOCK) {
+    console.log(`[MOCK] Shipping cost → pincode ${pincode}, weight ${weight}kg`);
+    return mockShippingCost();
+  }
+
+  try {
+    const token    = await getShiprocketToken();
+    const { data } = await axios.get(
+      'https://apiv2.shiprocket.in/v1/external/courier/serviceability/',
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        params: {
+          pickup_postcode:   process.env.YOUR_PINCODE,
+          delivery_postcode: pincode,
+          weight,
+          cod:               0,
+        },
+        timeout: 10000,
+      }
+    );
+
+    const companies = data.data?.available_courier_companies || [];
+    companies.sort((a, b) => (a.rate || 0) - (b.rate || 0));
+    const cheapest = companies[0];
+
+    return {
+      shipping_charge:    cheapest?.rate                    ?? 0,
+      courier_name:       cheapest?.courier_name            ?? 'Standard Delivery',
+      estimated_delivery: cheapest?.estimated_delivery_days ?? '5-7',
+    };
+  } catch (e) {
+    console.error('Shiprocket serviceability error:', e.response?.data || e.message);
+    // Safe fallback rather than exposing internal errors
+    return { shipping_charge: 99, courier_name: 'Standard Delivery', estimated_delivery: '5-7' };
+  }
+}
+
+// Shipping weight — ⚠️ keep in sync with UNIT_WEIGHT_KG / MIN_SHIPMENT_WEIGHT_KG in
+// frontend/src/data/dentallData.js so the quote shown equals the amount charged.
+// One family pack ≈ 0.25 kg (2 packs = 0.5 kg); Shiprocket minimum is 0.5 kg.
+const UNIT_WEIGHT_KG         = 0.25;
+const MIN_SHIPMENT_WEIGHT_KG = 0.5;
+const cartWeight = cartItems =>
+  Math.max(MIN_SHIPMENT_WEIGHT_KG, cartItems.reduce((s, i) => s + i.qty * UNIT_WEIGHT_KG, 0));
+
 // ── REAL Shiprocket order creation (3-step: create → courier → AWB) ──
 async function createShiprocketOrder({ orderId, customer, cartItems, totalAmount }) {
   const token   = await getShiprocketToken();
   const headers = { Authorization: `Bearer ${token}` };
 
-  // 0.5 kg per brush unit, minimum 0.5 kg
   const totalQty    = cartItems.reduce((s, i) => s + i.qty, 0);
-  const totalWeight = Math.max(0.5, cartItems.reduce((s, i) => s + i.qty * 0.5, 0));
+  const totalWeight = cartWeight(cartItems);
 
   const items = cartItems.map(i => ({
     name:          i.name,
@@ -602,6 +715,12 @@ async function generateReceiptPDF(customer, orderData) {
     y += 10;
     doc.moveTo(50, y).lineTo(562, y).strokeColor('#C8D6BE').lineWidth(1).stroke();
     y += 15;
+    if (orderData.discountAmount > 0) {
+      doc.fillColor('#5F6F63').font('Helvetica').fontSize(10)
+         .text(`Discount${orderData.couponCode ? ` (${orderData.couponCode})` : ''}:`, 380, y)
+         .text(`-Rs.${orderData.discountAmount.toLocaleString('en-IN')}`, 490, y);
+      y += 20;
+    }
     doc.fillColor('#5F6F63').font('Helvetica').fontSize(10)
        .text('Shipping:', 400, y)
        .text(orderData.shippingCharge === 0 ? 'FREE' : `Rs.${orderData.shippingCharge}`, 490, y);
@@ -673,7 +792,7 @@ async function sendReceiptEmail(customer, orderData) {
 
   const pdfBuffer = await generateReceiptPDF(customer, orderData);
 
-  const trackUrl = `${process.env.SITE_URL}/#tracking?order=${orderData.orderId}`;
+  const trackUrl = `${process.env.SITE_URL}/#shipment?order=${orderData.orderId}`;
 
   await sendDentallMail({
     from:    `DENTALL 🦷 <${process.env.EMAIL_FROM}>`,
@@ -681,22 +800,22 @@ async function sendReceiptEmail(customer, orderData) {
     subject: `✅ Your DENTALL Order #DNT-${orderData.orderId} — Receipt Enclosed`,
     html: `
     <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
-      <div style="background:linear-gradient(135deg,#3B1A08,var(--primary));padding:2rem;text-align:center;border-radius:12px 12px 0 0">
+      <div style="background:linear-gradient(135deg,#3B1A08,#C8102E);padding:2rem;text-align:center;border-radius:12px 12px 0 0">
         <h1 style="color:#fff;margin:0;font-size:1.8rem">DENTALL 🦷</h1>
         <p style="color:rgba(255,255,255,.8);margin:.3rem 0 0">Order Confirmed!</p>
       </div>
       <div style="padding:2rem;background:#FFFBF5;border:1px solid #E8D5B0">
-        <h2 style="color:var(--primary)">Hi ${sanitizeStr(customer.name)}! 🎉</h2>
+        <h2 style="color:#C8102E">Hi ${sanitizeStr(customer.name)}! 🎉</h2>
         <p style="color:#4A2C10;line-height:1.7">
           Your payment of <strong>₹${orderData.totalAmount.toLocaleString('en-IN')}</strong>
           was successful. Your DENTALL brushes will be shipped within 24 hours.
         </p>
-        <div style="background:#FFF3E8;border-left:4px solid var(--primary);padding:1rem;margin:1.5rem 0;border-radius:4px">
-          <p style="margin:0;color:var(--primary);font-weight:700">Order ID: DNT-${orderData.orderId}</p>
+        <div style="background:#FFF3E8;border-left:4px solid #C8102E;padding:1rem;margin:1.5rem 0;border-radius:4px">
+          <p style="margin:0;color:#C8102E;font-weight:700">Order ID: DNT-${orderData.orderId}</p>
           <p style="margin:.3rem 0 0;color:#4A2C10;font-size:.9rem">AWB: ${orderData.awb?.awb_code || 'Will be updated soon'}</p>
         </div>
         <div style="text-align:center;margin:1.5rem 0">
-          <a href="${trackUrl}" style="background:linear-gradient(135deg,var(--primary),var(--secondary));color:#fff;text-decoration:none;padding:.9rem 2.5rem;border-radius:30px;font-weight:700;font-size:.85rem;display:inline-block">
+          <a href="${trackUrl}" style="background:linear-gradient(135deg,#C8102E,#1a2642);color:#fff;text-decoration:none;padding:.9rem 2.5rem;border-radius:30px;font-weight:700;font-size:.85rem;display:inline-block">
             📦 Track My Order →
           </a>
         </div>
@@ -727,7 +846,7 @@ async function generateWholesalePricingPDF(enquiry) {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    doc.rect(0, 0, 612, 96).fill('#D30D2D');
+    doc.rect(0, 0, 612, 96).fill('#C8102E');
     doc.fillColor('#fff').font('Helvetica-Bold').fontSize(28).text('DENTALL', 50, 28);
     doc.font('Helvetica').fontSize(11).text('Wholesale Pricing Proposal', 50, 62);
 
@@ -762,7 +881,7 @@ async function generateWholesalePricingPDF(enquiry) {
     });
 
     y += 16;
-    doc.fillColor('#D30D2D').font('Helvetica-Bold').fontSize(13).text('Included benefits', 50, y);
+    doc.fillColor('#C8102E').font('Helvetica-Bold').fontSize(13).text('Included benefits', 50, y);
     y += 24;
     [
       'MOQ starts at 100 brushes.',
@@ -797,7 +916,7 @@ async function sendWholesalePricingEmail(enquiry) {
     subject: 'DENTALL Wholesale Pricing PDF',
     html: `
       <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto">
-        <div style="background:#D30D2D;color:#fff;padding:24px;border-radius:10px 10px 0 0">
+        <div style="background:#C8102E;color:#fff;padding:24px;border-radius:10px 10px 0 0">
           <h1 style="margin:0;font-size:24px">DENTALL Wholesale</h1>
           <p style="margin:6px 0 0">Your pricing PDF is attached.</p>
         </div>
@@ -903,42 +1022,7 @@ app.post('/api/shipping-cost', shippingLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid weight. Must be between 0.1 and 50kg' });
   }
 
-  if (USE_MOCK) {
-    console.log(`[MOCK] Shipping cost → pincode ${pincode}, weight ${weight}kg`);
-    return res.json(mockShippingCost());
-  }
-
-  // ── REAL SHIPROCKET ──
-  try {
-    const token    = await getShiprocketToken();
-    const { data } = await axios.get(
-      'https://apiv2.shiprocket.in/v1/external/courier/serviceability/',
-      {
-        headers: { Authorization: `Bearer ${token}` },
-        params: {
-          pickup_postcode:   process.env.YOUR_PINCODE,
-          delivery_postcode: pincode,
-          weight:            weight,
-          cod:               0,
-        },
-        timeout: 10000,
-      }
-    );
-
-    const companies = data.data?.available_courier_companies || [];
-    companies.sort((a, b) => (a.rate || 0) - (b.rate || 0));
-    const cheapest = companies[0];
-
-    res.json({
-      shipping_charge:    cheapest?.rate                     ?? 0,
-      courier_name:       cheapest?.courier_name             ?? 'Standard Delivery',
-      estimated_delivery: cheapest?.estimated_delivery_days  ?? '5-7',
-    });
-  } catch (e) {
-    console.error('Shiprocket serviceability error:', e.response?.data || e.message);
-    // Return a safe fallback rather than exposing internal errors
-    res.json({ shipping_charge: 99, courier_name: 'Standard Delivery', estimated_delivery: '5-7' });
-  }
+  res.json(await getShippingQuote(pincode, weight));
 });
 
 // ============================================================
@@ -954,7 +1038,14 @@ app.post('/api/create-order', paymentLimiter, async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
-  const shippingCharge = safeInt(req.body.shippingCharge, 0, 1000);
+  // ── Shipping is quoted SERVER-SIDE from the delivery pincode — the client's
+  //    shippingCharge is never trusted. ──
+  const pincode = sanitizePincode(req.body.pincode);
+  if (!isValidPincode(pincode)) {
+    return res.status(400).json({ error: 'Valid 6-digit delivery pincode required' });
+  }
+  const quote = await getShippingQuote(pincode, cartWeight(cartItems));
+  const shippingCharge = Math.round(safeInt(quote.shipping_charge, 0, 1000));
 
   // ── Compute total SERVER-SIDE using catalogue prices + live coupon ──
   const { subtotal, couponCode, discountPercent, discountAmount, total } =
@@ -974,6 +1065,7 @@ app.post('/api/create-order', paymentLimiter, async (req, res) => {
         source:         'dentall-web',
         item_count:     cartItems.length,
         shipping_charge: shippingCharge,
+        pincode,
         coupon_code:    couponCode || '',
       },
     });
@@ -985,6 +1077,7 @@ app.post('/api/create-order', paymentLimiter, async (req, res) => {
       amount:         order.amount,
       keyId:          process.env.RAZORPAY_KEY_ID, // safe to expose public key
       computedTotal:  order.amount / 100,           // let client display correct amount
+      shippingCharge,
       couponCode,
       discountPercent,
       discountAmount,
@@ -1011,7 +1104,6 @@ app.post('/api/verify-payment', paymentLimiter, async (req, res) => {
     razorpay_signature,
     customerDetails,
     cartItems: rawCartItems,
-    shippingCharge: rawShippingCharge,
     couponCode: rawCouponCode,
   } = req.body;
 
@@ -1067,7 +1159,9 @@ app.post('/api/verify-payment', paymentLimiter, async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
-  const shippingCharge = safeInt(rawShippingCharge, 0, 1000);
+  // Shipping comes from the Razorpay order notes written by /api/create-order
+  // (server-quoted), never from the request body.
+  const shippingCharge = safeInt(rzpOrder.notes?.shipping_charge, 0, 1000);
   const { subtotal, couponCode, discountPercent, discountAmount, total } =
     computeCartTotal(cartItems, shippingCharge, rawCouponCode);
   const expectedPaise = Math.round(total * 100);
@@ -1094,6 +1188,10 @@ app.post('/api/verify-payment', paymentLimiter, async (req, res) => {
   if (!isValidEmail(customer.email)) return res.status(400).json({ error: 'Valid email required' });
   if (!isValidPhone(customer.phone)) return res.status(400).json({ error: 'Valid phone required' });
   if (!isValidPincode(customer.pincode)) return res.status(400).json({ error: 'Valid pincode required' });
+  if (String(rzpOrder.notes?.pincode) !== customer.pincode) {
+    console.error(`❌ Pincode mismatch: quoted ${rzpOrder.notes?.pincode}, submitted ${customer.pincode}`);
+    return res.status(400).json({ error: 'Delivery pincode does not match the one used for shipping quote' });
+  }
 
   // ── 7. Idempotency / replay attack prevention ──
   try {
@@ -1163,10 +1261,71 @@ app.post('/api/verify-payment', paymentLimiter, async (req, res) => {
   // ── 10. Send receipt email (non-blocking — don't fail the response) ──
   sendReceiptEmail(customer, {
     orderId, razorpay_payment_id, cartItems, totalAmount, shippingCharge, awb,
+    discountAmount, couponCode,
   }).catch(mailErr => console.error('⚠️  Email failed:', mailErr.message));
 
   res.json({ success: true, orderId, awb: awb.awb_code });
 });
+
+// ============================================================
+//  TRACKING helpers
+//  Shiprocket's track response is nested (numeric shipment_status, courier and
+//  AWB inside shipment_track[0], events in shipment_track_activities). The
+//  storefront expects one flat shape, so every tracking route goes through
+//  normalizeTracking() — real and mock data alike.
+// ============================================================
+function normalizeTracking(raw, { awb = null } = {}) {
+  const t          = raw || {};
+  const trk        = Array.isArray(t.shipment_track) ? t.shipment_track[0] : null;
+  const activities = Array.isArray(t.shipment_track_activities) ? t.shipment_track_activities
+                   : Array.isArray(t.tracking_data)             ? t.tracking_data
+                   : [];
+  const statusText = trk?.current_status
+                  || (typeof t.shipment_status === 'string' ? t.shipment_status : '');
+  return {
+    shipment_status: String(statusText || (awb ? 'AWB ASSIGNED' : 'PROCESSING')).toUpperCase(),
+    awb_code:        trk?.awb_code || t.awb_code || awb || null,
+    courier_name:    trk?.courier_name || t.courier_name || null,
+    etd:             t.etd || trk?.edd || null,
+    track_url:       t.track_url || null,
+    tracking_data:   activities.map(a => ({
+      activity: a.activity || a.status || a['sr-status-label'] || '',
+      date:     a.date || '',
+      location: a.location || '',
+    })),
+  };
+}
+
+// Shipment that has not been booked with a courier yet (e.g. Shiprocket was down at checkout)
+function pendingShipmentTracking() {
+  return {
+    shipment_status: 'PROCESSING',
+    awb_code:        null,
+    courier_name:    null,
+    etd:             null,
+    track_url:       null,
+    tracking_data:   [],
+    message:         'Your order is confirmed and your shipment is being prepared. Tracking will appear here once the courier picks it up.',
+  };
+}
+
+// Fetch + normalise live tracking for an AWB. A courier that has no scans yet
+// makes Shiprocket answer with an empty/error body — that is "AWB ASSIGNED", not a failure.
+async function fetchShiprocketTracking(awb) {
+  try {
+    const token    = await getShiprocketToken();
+    const { data } = await axios.get(
+      `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
+    );
+    return normalizeTracking(data?.tracking_data, { awb });
+  } catch (e) {
+    if (e.response?.status === 404 || e.response?.status === 400) {
+      return normalizeTracking({}, { awb });
+    }
+    throw e;
+  }
+}
 
 // ============================================================
 //  ROUTE: GET /api/track/:orderId
@@ -1185,33 +1344,29 @@ app.get('/api/track/:orderId', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    const { awb_number, status, customer_name, created_at } = rows[0];
+    const { awb_number, customer_name, created_at } = rows[0];
+    const base = {
+      order_id:      orderId,
+      // first name only — order IDs are sequential, so don't expose full names
+      customer_name: String(customer_name || '').trim().split(/\s+/)[0] || null,
+      order_date:    created_at,
+    };
 
-    if (USE_MOCK || !awb_number || awb_number.startsWith('TEST-') || awb_number.startsWith('PENDING-')) {
+    if (USE_MOCK || (awb_number && awb_number.startsWith('TEST-'))) {
       return res.json({
-        ...mockTrackingData(awb_number || String(orderId), orderId),
-        order_id:     orderId,
-        customer_name,
-        order_date:   created_at,
+        ...normalizeTracking(mockTrackingData(awb_number || String(orderId), orderId), { awb: awb_number }),
+        ...base,
       });
     }
 
-    // ── REAL SHIPROCKET ──
-    const token    = await getShiprocketToken();
-    const { data } = await axios.get(
-      `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb_number}`,
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
-    );
+    if (!awb_number || awb_number.startsWith('PENDING-')) {
+      return res.json({ ...pendingShipmentTracking(), ...base });
+    }
 
-    res.json({
-      ...data.tracking_data,
-      order_id:     orderId,
-      customer_name,
-      order_date:   created_at,
-    });
+    res.json({ ...(await fetchShiprocketTracking(awb_number)), ...base });
   } catch (e) {
     console.error('Tracking error:', e.response?.data || e.message);
-    res.status(500).json({ error: 'Could not fetch tracking information' });
+    res.status(500).json({ error: 'Could not fetch tracking information. Please try again shortly.' });
   }
 });
 
@@ -1224,16 +1379,15 @@ app.get('/api/shipment/awb/:awbNumber', async (req, res) => {
   if (!awb) return res.status(400).json({ error: 'Invalid AWB number' });
 
   if (USE_MOCK) {
-    return res.json(mockTrackingData(awb, 'N/A'));
+    return res.json(normalizeTracking(mockTrackingData(awb, 'N/A'), { awb }));
+  }
+
+  if (awb.startsWith('PENDING-')) {
+    return res.json(pendingShipmentTracking());
   }
 
   try {
-    const token    = await getShiprocketToken();
-    const { data } = await axios.get(
-      `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`,
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
-    );
-    res.json(data.tracking_data || {});
+    res.json(await fetchShiprocketTracking(awb));
   } catch (e) {
     console.error('AWB tracking error:', e.response?.data || e.message);
     res.status(500).json({ error: 'Could not fetch tracking info for this AWB' });
@@ -1246,13 +1400,13 @@ app.get('/api/shipment/awb/:awbNumber', async (req, res) => {
 //  Add your admin auth middleware before going live.
 // ============================================================
 
-// ── TODO: Replace this stub with real JWT/session auth ──
+// Shared-secret auth for admin routes. Enforced in every environment
+// (DENTALL_ADMIN_SECRET is required at boot) with a constant-time compare.
 function adminAuthMiddleware(req, res, next) {
-  const token = req.headers['x-admin-token'];
-  if (!IS_PROD) return next(); // skip in dev for convenience
-
-  // In production: validate JWT or session here
-  if (!token || token !== process.env.DENTALL_ADMIN_SECRET) {
+  const token  = String(req.headers['x-admin-token'] || '');
+  const secret = process.env.DENTALL_ADMIN_SECRET;
+  const digest = s => crypto.createHash('sha256').update(s).digest();
+  if (!secret || !token || !crypto.timingSafeEqual(digest(token), digest(secret))) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
@@ -1441,6 +1595,321 @@ app.post('/api/wholesale-enquiries', leadLimiter, async (req, res) => {
 });
 
 // ============================================================
+//  DEALER ENQUIRIES & QUOTES  (Phase 1)
+//  Dealer submits an enquiry -> admin creates a custom-priced quote ->
+//  dealer receives a private, unguessable link that shows that quote.
+//  Quote prices live ONLY in the dealer_quotes table (set by the admin);
+//  nothing a dealer's browser sends can change them.
+// ============================================================
+const GSTIN_RE       = /^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$/;
+const DEALER_MIN_QTY = 100;
+const round2         = n => Math.round(n * 100) / 100;
+const inr            = n => `₹${Number(n).toLocaleString('en-IN')}`;
+
+// All quote money maths in one place (admin preview, DB read-back, emails)
+function computeDealerQuote({ quantity, goodsTotal, gstPercent, freight, advancePercent }) {
+  const gstAmount     = round2(goodsTotal * gstPercent / 100);
+  const total         = round2(goodsTotal + gstAmount + freight);
+  const advanceAmount = round2(total * advancePercent / 100);
+  return {
+    unitPrice: round2(goodsTotal / quantity),
+    goodsTotal, gstPercent, gstAmount, freight, total,
+    advancePercent, advanceAmount,
+    balanceDue: round2(total - advanceAmount),
+  };
+}
+
+// Columns every quote SELECT needs (valid_until formatted so timezones can't shift the date)
+const QUOTE_COLS = `id, enquiry_id, token, quantity, goods_total, gst_percent, freight, advance_percent,
+  notes, DATE_FORMAT(valid_until, '%Y-%m-%d') AS valid_until, status, created_at`;
+
+function formatQuoteRow(row) {
+  const calc = computeDealerQuote({
+    quantity:       Number(row.quantity),
+    goodsTotal:     Number(row.goods_total),
+    gstPercent:     Number(row.gst_percent),
+    freight:        Number(row.freight),
+    advancePercent: Number(row.advance_percent),
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  return {
+    id:         row.id,
+    quantity:   Number(row.quantity),
+    ...calc,
+    notes:      row.notes || '',
+    validUntil: row.valid_until,
+    status:     row.status === 'sent' && row.valid_until < today ? 'expired' : row.status,
+    createdAt:  row.created_at,
+  };
+}
+
+const paymentTermsText = q =>
+  q.advancePercent > 0
+    ? `${q.advancePercent}% advance (${inr(q.advanceAmount)}), balance ${inr(q.balanceDue)} on delivery`
+    : `Cash on delivery (${inr(q.total)})`;
+
+async function sendDealerEnquiryEmails(e) {
+  const notify = process.env.ADMIN_NOTIFY_EMAIL || process.env.EMAIL_FROM;
+  await sendDentallMail({
+    from:    `DENTALL Dealers <${process.env.EMAIL_FROM}>`,
+    to:      notify,
+    subject: `New dealer enquiry — ${e.shop} (${e.quantity} units)`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:560px">
+        <h2 style="color:#C8102E;margin:0 0 12px">New dealer enquiry</h2>
+        <p><strong>${e.shop}</strong> — ${e.name}<br>
+           GSTIN: ${e.gstin}<br>
+           Phone: ${e.phone} · Email: ${e.email}<br>
+           ${e.address}, ${e.city}, ${e.state} - ${e.pincode}</p>
+        <p>Quantity wanted: <strong>${e.quantity}</strong> units</p>
+        ${e.message ? `<p>Message: ${e.message}</p>` : ''}
+        <p style="color:#666;font-size:12px">Open /admin to create a quote.</p>
+      </div>`,
+  });
+
+  if (!isValidEmail(e.email)) return;
+  await sendDentallMail({
+    from:    `DENTALL Dealers <${process.env.EMAIL_FROM}>`,
+    to:      e.email,
+    subject: 'We received your DENTALL dealer enquiry',
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+        <div style="background:#C8102E;color:#fff;padding:22px;border-radius:10px 10px 0 0">
+          <h1 style="margin:0;font-size:22px">DENTALL Dealers</h1>
+          <p style="margin:6px 0 0">Enquiry received</p>
+        </div>
+        <div style="border:1px solid #eee;border-top:0;padding:22px;color:#333;line-height:1.7">
+          <p>Hi ${e.name},</p>
+          <p>Thanks for your enquiry for <strong>${e.quantity}</strong> units for <strong>${e.shop}</strong>.
+             Our team will send you a price quote by email within 24 hours.</p>
+          <p style="font-size:12px;color:#777">Questions? Reply to this email or write to support@dentall.in</p>
+        </div>
+      </div>`,
+  });
+}
+
+async function sendDealerQuoteEmail(enquiry, quote, link) {
+  if (!isValidEmail(enquiry.email)) return;
+  await sendDentallMail({
+    from:    `DENTALL Dealers <${process.env.EMAIL_FROM}>`,
+    to:      enquiry.email,
+    subject: `Your DENTALL quote — ${quote.quantity} units (${inr(quote.total)})`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
+        <div style="background:#C8102E;color:#fff;padding:22px;border-radius:10px 10px 0 0">
+          <h1 style="margin:0;font-size:22px">DENTALL Dealers</h1>
+          <p style="margin:6px 0 0">Your price quote is ready</p>
+        </div>
+        <div style="border:1px solid #eee;border-top:0;padding:22px;color:#333;line-height:1.7">
+          <p>Hi ${enquiry.contact_name},</p>
+          <p>Here is your quote for <strong>${enquiry.shop_name}</strong>:</p>
+          <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <tr><td>Quantity</td><td style="text-align:right">${quote.quantity} units</td></tr>
+            <tr><td>Price per unit</td><td style="text-align:right">${inr(quote.unitPrice)}</td></tr>
+            <tr><td>Goods total</td><td style="text-align:right">${inr(quote.goodsTotal)}</td></tr>
+            ${quote.gstPercent > 0 ? `<tr><td>GST (${quote.gstPercent}%)</td><td style="text-align:right">${inr(quote.gstAmount)}</td></tr>` : ''}
+            <tr><td>Freight</td><td style="text-align:right">${quote.freight > 0 ? inr(quote.freight) : 'Included / as agreed'}</td></tr>
+            <tr style="font-weight:bold;border-top:2px solid #C8102E"><td style="padding-top:8px">Total</td><td style="text-align:right;padding-top:8px">${inr(quote.total)}</td></tr>
+          </table>
+          <p><strong>Payment:</strong> ${paymentTermsText(quote)}<br>
+             <strong>Valid until:</strong> ${quote.validUntil}</p>
+          ${quote.notes ? `<p><strong>Notes:</strong> ${quote.notes}</p>` : ''}
+          <p style="text-align:center;margin:22px 0">
+            <a href="${link}" style="background:#C8102E;color:#fff;text-decoration:none;padding:12px 28px;border-radius:24px;font-weight:bold;display:inline-block">View your quote →</a>
+          </p>
+          <p style="font-size:12px;color:#777">To confirm this order, reply to this email or call us. This link is private — please don't share it.</p>
+        </div>
+      </div>`,
+  });
+}
+
+// ── Public: dealer submits an enquiry ──
+app.post('/api/dealer-enquiries', leadLimiter, async (req, res) => {
+  const b = req.body || {};
+  const e = {
+    name:     sanitizeStr(b.name, 150),
+    shop:     sanitizeStr(b.shop, 180),
+    gstin:    sanitizeStr(b.gstin, 15).toUpperCase(),
+    email:    sanitizeStr(b.email, 150).toLowerCase(),
+    phone:    sanitizePhone(b.phone),
+    address:  sanitizeStr(b.address, 500),
+    city:     sanitizeStr(b.city, 100),
+    state:    sanitizeStr(b.state, 100),
+    pincode:  sanitizePincode(b.pincode),
+    quantity: safeInt(b.quantity, 0, 1000000),
+    message:  sanitizeStr(b.message, 1000),
+  };
+
+  if (!e.name)                       return res.status(400).json({ error: 'Contact name is required.' });
+  if (!e.shop)                       return res.status(400).json({ error: 'Shop / business name is required.' });
+  if (!GSTIN_RE.test(e.gstin))       return res.status(400).json({ error: 'Enter a valid 15-character GSTIN.' });
+  if (!isValidEmail(e.email))        return res.status(400).json({ error: 'Valid email address is required.' });
+  if (!isValidPhone(e.phone))        return res.status(400).json({ error: 'Valid 10-digit mobile number is required.' });
+  if (!e.address)                    return res.status(400).json({ error: 'Shop address is required.' });
+  if (!e.city || !e.state)           return res.status(400).json({ error: 'City and state are required.' });
+  if (!isValidPincode(e.pincode))    return res.status(400).json({ error: 'Valid 6-digit pincode is required.' });
+  if (e.quantity < DEALER_MIN_QTY)   return res.status(400).json({ error: `Minimum dealer quantity is ${DEALER_MIN_QTY} units.` });
+
+  try {
+    const [result] = await db.execute(
+      `INSERT INTO dealer_enquiries
+       (contact_name, shop_name, gstin, email, phone, address, city, state, pincode, quantity, message)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [e.name, e.shop, e.gstin, e.email, e.phone, e.address, e.city, e.state, e.pincode, e.quantity, e.message]
+    );
+    console.log(`✅ Dealer enquiry saved: id=${result.insertId} (${e.quantity} units)`);
+    sendDealerEnquiryEmails(e).catch(err => console.error('⚠️  Dealer enquiry email failed:', err.message));
+    res.json({ success: true, enquiryId: result.insertId });
+  } catch (err) {
+    console.error('Dealer enquiry failed:', err.message);
+    res.status(500).json({ error: 'Could not save your enquiry. Please try again.' });
+  }
+});
+
+// ── Admin: list enquiries with their quotes ──
+app.get('/api/admin/dealer-enquiries', adminAuthMiddleware, async (req, res) => {
+  try {
+    const [enquiries] = await db.execute(
+      `SELECT id, contact_name, shop_name, gstin, email, phone, address, city, state, pincode,
+              quantity, message, status, created_at
+       FROM dealer_enquiries ORDER BY created_at DESC LIMIT 200`
+    );
+    const [quotes] = await db.execute(
+      `SELECT ${QUOTE_COLS} FROM dealer_quotes ORDER BY created_at DESC`
+    );
+    const byEnquiry = {};
+    for (const row of quotes) {
+      (byEnquiry[row.enquiry_id] ||= []).push({
+        ...formatQuoteRow(row),
+        link: `${process.env.SITE_URL}/dealer-quote/${row.token}`,
+      });
+    }
+    res.json(enquiries.map(e => ({ ...e, quotes: byEnquiry[e.id] || [] })));
+  } catch (err) {
+    console.error('Dealer enquiries list failed:', err.message);
+    res.status(500).json({ error: 'Could not load dealer enquiries.' });
+  }
+});
+
+// ── Admin: create a custom-priced quote and email the private link ──
+app.post('/api/admin/dealer-quotes', adminAuthMiddleware, async (req, res) => {
+  const b = req.body || {};
+  const enquiryId      = safeInt(b.enquiryId, 0);
+  const quantity       = safeInt(b.quantity, 0, 1000000);
+  // The admin enters the price PER UNIT (each dealer can get a different one);
+  // the goods total for the whole order is derived from it.
+  const unitPrice      = round2(Number(b.unitPrice));
+  const goodsTotal     = round2(unitPrice * quantity);
+  const gstPercent     = round2(Number(b.gstPercent || 0));
+  const freight        = round2(Number(b.freight || 0));
+  const advancePercent = round2(Number(b.advancePercent || 0));
+  const validDays      = safeInt(b.validDays || 7, 1, 60);
+  const notes          = sanitizeStr(b.notes, 1000);
+
+  if (!enquiryId)                                           return res.status(400).json({ error: 'Unknown enquiry.' });
+  if (quantity < 1)                                         return res.status(400).json({ error: 'Quantity must be at least 1.' });
+  if (!Number.isFinite(unitPrice) || unitPrice <= 0 || unitPrice > 100000)
+                                                            return res.status(400).json({ error: 'Price per unit must be between ₹0.01 and ₹1,00,000.' });
+  if (goodsTotal > 10000000)                                return res.status(400).json({ error: 'Goods total cannot exceed ₹1,00,00,000 — check the quantity and price per unit.' });
+  if (!Number.isFinite(gstPercent) || gstPercent < 0 || gstPercent > 28)
+                                                            return res.status(400).json({ error: 'GST % must be between 0 and 28.' });
+  if (!Number.isFinite(freight) || freight < 0 || freight > 1000000)
+                                                            return res.status(400).json({ error: 'Freight must be between ₹0 and ₹10,00,000.' });
+  if (!Number.isFinite(advancePercent) || advancePercent < 0 || advancePercent > 100)
+                                                            return res.status(400).json({ error: 'Advance % must be between 0 and 100.' });
+
+  try {
+    const [found] = await db.execute(
+      'SELECT id, contact_name, shop_name, email FROM dealer_enquiries WHERE id = ? LIMIT 1', [enquiryId]
+    );
+    if (!found.length) return res.status(404).json({ error: 'Enquiry not found.' });
+    const enquiry = found[0];
+
+    const token = crypto.randomBytes(32).toString('hex'); // 256-bit, unguessable
+    const [result] = await db.execute(
+      `INSERT INTO dealer_quotes
+       (enquiry_id, token, quantity, goods_total, gst_percent, freight, advance_percent, notes, valid_until, status)
+       VALUES (?,?,?,?,?,?,?,?, DATE_ADD(CURDATE(), INTERVAL ? DAY), 'sent')`,
+      [enquiryId, token, quantity, goodsTotal, gstPercent, freight, advancePercent, notes, validDays]
+    );
+    await db.execute(`UPDATE dealer_enquiries SET status = 'quoted' WHERE id = ? AND status = 'new'`, [enquiryId]);
+
+    const [rows] = await db.execute(`SELECT ${QUOTE_COLS} FROM dealer_quotes WHERE id = ?`, [result.insertId]);
+    const quote  = formatQuoteRow(rows[0]);
+    const link   = `${process.env.SITE_URL}/dealer-quote/${token}`;
+
+    let emailed = true;
+    try { await sendDealerQuoteEmail(enquiry, quote, link); }
+    catch (mailErr) { emailed = false; console.error('⚠️  Dealer quote email failed:', mailErr.message); }
+
+    console.log(`✅ Dealer quote created: id=${result.insertId} enquiry=${enquiryId} total=${inr(quote.total)}`);
+    res.json({ success: true, quote: { ...quote, link }, emailed });
+  } catch (err) {
+    console.error('Dealer quote creation failed:', err.message);
+    res.status(500).json({ error: 'Could not create the quote.' });
+  }
+});
+
+// ── Admin: cancel a quote (its link stops working) / close an enquiry ──
+app.post('/api/admin/dealer-quotes/:id/cancel', adminAuthMiddleware, async (req, res) => {
+  const id = safeInt(req.params.id, 0);
+  if (!id) return res.status(400).json({ error: 'Invalid quote ID' });
+  try {
+    await db.execute(`UPDATE dealer_quotes SET status = 'cancelled' WHERE id = ?`, [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not cancel the quote.' });
+  }
+});
+
+app.post('/api/admin/dealer-enquiries/:id/status', adminAuthMiddleware, async (req, res) => {
+  const id     = safeInt(req.params.id, 0);
+  const status = String(req.body?.status || '');
+  if (!id || !['new', 'quoted', 'closed'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid request' });
+  }
+  try {
+    await db.execute('UPDATE dealer_enquiries SET status = ? WHERE id = ?', [status, id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not update the enquiry.' });
+  }
+});
+
+// ── Public: dealer opens their private quote link ──
+app.get('/api/dealer-quote/:token', shippingLimiter, async (req, res) => {
+  const token = String(req.params.token || '');
+  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(404).json({ error: 'Quote not found.' });
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT q.id, q.enquiry_id, q.token, q.quantity, q.goods_total, q.gst_percent, q.freight,
+              q.advance_percent, q.notes, DATE_FORMAT(q.valid_until, '%Y-%m-%d') AS valid_until,
+              q.status, q.created_at, e.shop_name, e.contact_name, e.city, e.state
+       FROM dealer_quotes q JOIN dealer_enquiries e ON e.id = q.enquiry_id
+       WHERE q.token = ? LIMIT 1`,
+      [token]
+    );
+    if (!rows.length || rows[0].status === 'cancelled') {
+      return res.status(404).json({ error: 'This quote is no longer available. Please contact us.' });
+    }
+    const row = rows[0];
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      shopName:    row.shop_name,
+      contactName: row.contact_name,
+      city:        row.city,
+      state:       row.state,
+      quote:       formatQuoteRow(row),
+      paymentTerms: paymentTermsText(formatQuoteRow(row)),
+    });
+  } catch (err) {
+    console.error('Dealer quote fetch failed:', err.message);
+    res.status(500).json({ error: 'Could not load this quote.' });
+  }
+});
+
+// ============================================================
 //  ROUTE: POST /api/capture-lead
 //  Saves email leads and sends welcome/discount email.
 // ============================================================
@@ -1472,24 +1941,24 @@ app.post('/api/capture-lead', leadLimiter, async (req, res) => {
       subject: '🦷 Special Offer Just for You — 10% Off Your First DENTALL Order!',
       html: `
       <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
-        <div style="background:linear-gradient(135deg,#3B1A08,var(--primary),var(--secondary));padding:2.5rem;text-align:center;border-radius:12px 12px 0 0">
+        <div style="background:linear-gradient(135deg,#3B1A08,#C8102E,#1a2642);padding:2.5rem;text-align:center;border-radius:12px 12px 0 0">
           <h1 style="color:#fff;margin:0;font-size:2rem">DENTALL 🦷</h1>
           <p style="color:rgba(255,255,255,.85);margin:.5rem 0 0">Professional Dental Care</p>
         </div>
         <div style="padding:2.5rem;background:#FFFBF5;border:1px solid #E8D5B0">
-          <h2 style="color:var(--primary);margin-top:0">Hi${name ? ' ' + sanitizeStr(name) : ''}! 👋</h2>
+          <h2 style="color:#C8102E;margin-top:0">Hi${name ? ' ' + sanitizeStr(name) : ''}! 👋</h2>
           <p style="color:#4A2C10;line-height:1.8">Thanks for your interest in DENTALL. Here's your exclusive welcome discount:</p>
-          <div style="background:linear-gradient(135deg,var(--primary),var(--secondary));border-radius:12px;padding:2rem;text-align:center;margin:1.5rem 0">
+          <div style="background:linear-gradient(135deg,#C8102E,#1a2642);border-radius:12px;padding:2rem;text-align:center;margin:1.5rem 0">
             <p style="color:rgba(255,255,255,.8);margin:0;font-size:.85rem;text-transform:uppercase;letter-spacing:.1em">Exclusive Welcome Offer</p>
             <h2 style="color:#fff;font-size:3rem;margin:.3rem 0">10% OFF</h2>
             <p style="color:rgba(255,255,255,.9);margin:0 0 1rem">on your first order</p>
             <div style="background:#fff;border-radius:8px;padding:.8rem 1.5rem;display:inline-block">
-              <span style="color:var(--primary);font-weight:900;font-size:1.2rem;letter-spacing:.1em">WELCOME10</span>
+              <span style="color:#C8102E;font-weight:900;font-size:1.2rem;letter-spacing:.1em">WELCOME10</span>
             </div>
           </div>
           <div style="text-align:center;margin:2rem 0">
             <a href="${process.env.SITE_URL}/#order"
-               style="background:linear-gradient(135deg,var(--primary),var(--secondary));color:#fff;text-decoration:none;padding:1rem 2.5rem;border-radius:30px;font-weight:700;font-size:.9rem;display:inline-block">
+               style="background:linear-gradient(135deg,#C8102E,#1a2642);color:#fff;text-decoration:none;padding:1rem 2.5rem;border-radius:30px;font-weight:700;font-size:.9rem;display:inline-block">
               Shop Now →
             </a>
           </div>
@@ -1526,14 +1995,10 @@ const reviewLimiter = rateLimit({
 });
 
 app.post('/api/reviews', reviewLimiter, async (req, res) => {
-  console.log('📝 Review POST received:', JSON.stringify(req.body));
-
-  const name   = sanitizeStr(req.body?.name,  100);
+  const name  = sanitizeStr(req.body?.name,  100);
   const email  = sanitizeStr(req.body?.email, 150).toLowerCase();
   const rating = Math.round(Number(req.body?.rating));
   const text   = sanitizeStr(req.body?.text,  1000);
-
-  console.log(`   name="${name}" email="${email}" rating=${rating} text="${text?.slice(0,40)}..."`);
 
   if (!name || name.length < 2)   return res.status(400).json({ error: 'Name must be at least 2 characters.' });
   if (!isValidEmail(email))        return res.status(400).json({ error: 'Invalid email address.' });

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import AdminDealers from "./AdminDealers";
 
 const TOKEN_KEY = 'dn_admin_token';
 const PRODUCT_NAMES = { 'family-pack': 'Family Pack (12 brushes)' };
@@ -283,6 +284,8 @@ export default function AdminPricing() {
           </div>
         )}
       </div>
+
+      <AdminDealers token={token} />
     </div>
   );
 }

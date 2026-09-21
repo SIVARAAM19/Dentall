@@ -8,6 +8,14 @@ export const FAMILY_PACK_PRICE = 599;
 // Set to null to hide the offer badge (no sale running).
 export const FAMILY_PACK_MRP = null;
 
+// Shipping weight used for the courier quote. One family pack ≈ 0.25 kg, so
+// 2 packs = 0.5 kg; couriers bill a minimum of 0.5 kg.
+// ⚠️ Must match UNIT_WEIGHT_KG / MIN_SHIPMENT_WEIGHT_KG in backend/server.js.
+export const UNIT_WEIGHT_KG         = 0.25;
+export const MIN_SHIPMENT_WEIGHT_KG = 0.5;
+export const cartWeightKg = items =>
+  Math.max(MIN_SHIPMENT_WEIGHT_KG, items.reduce((sum, i) => sum + i.qty * UNIT_WEIGHT_KG, 0));
+
 // Auto-calculates the discount % from MRP vs selling price — no manual math.
 export const discountPercent = (mrp, price) =>
   mrp && mrp > price ? Math.round(((mrp - price) / mrp) * 100) : 0;
@@ -17,7 +25,6 @@ export const discountPercent = (mrp, price) =>
 // "Leave us a review on Google" button after a review is submitted.
 export const GOOGLE_REVIEW_ENABLED = false;
 export const GOOGLE_PLACE_ID = '';
-// const RAZORPAY_KEY_ID = "rzp_test_SlG1HvlDp3i5Fw"; // ← replace with your key
 
 export const FEATURES = [
   { num:"01", icon:"🦷", title:"Nano Bristle Technology", text:"10,000 micro-filaments per cm² with varying stiffness — hard on plaque, gentle on enamel and gums." },

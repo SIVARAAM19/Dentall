@@ -23,9 +23,24 @@
   color: var(--primary); 
 }
 
-.dn-footer-copy { 
-  font-size: 0.71rem; 
-  color: var(--text-light); 
+.dn-footer-copy {
+  font-size: 0.71rem;
+  color: var(--text-light);
+}
+
+.dn-footer-credit {
+  font-size: 0.71rem;
+  color: var(--text-light);
+}
+
+.dn-footer-credit a {
+  color: var(--text-light);
+  text-decoration: underline;
+  transition: color 0.3s;
+}
+
+.dn-footer-credit a:hover {
+  color: var(--primary);
 }
 
 .dn-footer-links { 

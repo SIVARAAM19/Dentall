@@ -1,6 +1,6 @@
 -- In MySQL terminal
-CREATE DATABASE dentall_db;
-USE dentall_db;
+-- Hostinger creates the database for you (e.g. u598097533_dentall_db); select it in phpMyAdmin instead.
+
 
 
 
@@ -86,4 +86,43 @@ CREATE TABLE IF NOT EXISTS wholesale_enquiries (
   INDEX idx_email   (email),
   INDEX idx_status  (status),
   INDEX idx_created (created_at)
+);
+
+-- Retail dealer enquiries (submitted from the "Dealers" form on the site)
+CREATE TABLE IF NOT EXISTS dealer_enquiries (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  contact_name  VARCHAR(150) NOT NULL,
+  shop_name     VARCHAR(180) NOT NULL,
+  gstin         VARCHAR(15)  NOT NULL,
+  email         VARCHAR(150) NOT NULL,
+  phone         VARCHAR(20)  NOT NULL,
+  address       TEXT         NOT NULL,
+  city          VARCHAR(100) NOT NULL,
+  state         VARCHAR(100) NOT NULL,
+  pincode       VARCHAR(6)   NOT NULL,
+  quantity      INT          NOT NULL,
+  message       TEXT,
+  status        VARCHAR(30)  DEFAULT 'new',   -- new | quoted | closed
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_dealer_email   (email),
+  INDEX idx_dealer_status  (status),
+  INDEX idx_dealer_created (created_at)
+);
+
+-- Custom-priced quotes created by the admin; each has a private, unguessable link token
+CREATE TABLE IF NOT EXISTS dealer_quotes (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  enquiry_id      INT           NOT NULL,
+  token           CHAR(64)      NOT NULL,
+  quantity        INT           NOT NULL,
+  goods_total     DECIMAL(12,2) NOT NULL,
+  gst_percent     DECIMAL(5,2)  NOT NULL DEFAULT 0,
+  freight         DECIMAL(10,2) NOT NULL DEFAULT 0,
+  advance_percent DECIMAL(5,2)  NOT NULL DEFAULT 0,   -- 0 = full cash on delivery
+  notes           TEXT,
+  valid_until     DATE          NOT NULL,
+  status          VARCHAR(20)   NOT NULL DEFAULT 'sent',  -- sent | cancelled (| accepted, later phase)
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_quote_token (token),
+  INDEX idx_quote_enquiry (enquiry_id)
 );
